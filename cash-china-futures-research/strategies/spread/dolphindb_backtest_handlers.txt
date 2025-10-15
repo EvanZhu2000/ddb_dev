@@ -1,0 +1,168 @@
+// ================================
+// DolphinDB Streaming Backtest Handlers  
+// ================================
+
+// Global state variables
+mutable position = 0
+mutable entryPriceRatio = 0.0, entryPrice1 = 0.0, entryPrice2 = 0.0
+mutable entryTime = timestamp(NULL), holdingMinutes = 0, forceExit = false, tradeId = 0, tradeCounter = 0  
+mutable prevClose1 = 0.0, prevClose2 = 0.0
+
+// Signal lag buffer - critical for exact replication!
+mutable signalBuffer = array(DOUBLE, 0)
+mutable bufferMaxSize = 10  // Adjust based on max expected lag
+
+// Configuration 
+mutable config = dict(`entryPrice`exitPrice`lag`stopLoss`maxHolding`maxGapDays, ["open","open",1,NULL,NULL,NULL])
+
+// Results storage
+mutable results = table(100:0, `datetime`position`logReturn`realReturn`tradeId, [DATETIME,INT,DOUBLE,DOUBLE,INT])
+mutable trades = table(100:0, `tradeId`entryTime`exitTime`duration`logReturn`realReturn`direction, [INT,DATETIME,DATETIME,INT,DOUBLE,DOUBLE,INT])
+
+def backtestHandler(msg) {
+    dt = msg.datetime[0]  
+    currentSignal = msg.signal[0]
+    
+    // Store current signal in buffer
+    signalBuffer.append!(currentSignal)
+    if (signalBuffer.size() > bufferMaxSize) {
+        signalBuffer = signalBuffer[(signalBuffer.size() - bufferMaxSize):]  // Keep only recent values
+    }
+    
+    // Apply lag to signal - CRITICAL for exact replication!
+    lag = config[`lag]
+    if (signalBuffer.size() > lag) {
+        signal = signalBuffer[signalBuffer.size() - 1 - lag]  // Get lagged signal
+    } else {
+        signal = NULL  // No signal available yet (like np.nan in original)
+    }
+    
+    // Get prices directly
+    entryType = config[`entryPrice]
+    exitType = config[`exitPrice] 
+    
+    open1 = msg[entryType + "_1"][0]; open2 = msg[entryType + "_2"][0]
+    exit1 = msg[exitType + "_1"][0]; exit2 = msg[exitType + "_2"][0]
+    close1 = msg.close_1[0]; close2 = msg.close_2[0]
+    
+    logRet = 0.0; realRet = 0.0
+    
+    // Forced Exit
+    if (forceExit && position != 0) {
+        exitRatio = position * (log(exit1) - log(exit2))
+        tradeLogRet = exitRatio - entryPriceRatio
+        tradeRealRet = position * ((exit1/entryPrice1) - (exit2/entryPrice2))
+        
+        logRet = position * ((log(exit1) - log(exit2)) - (log(prevClose1) - log(prevClose2)))
+        realRet = position * ((exit1/prevClose1) - (exit2/prevClose2))
+        
+        insert into trades values(tradeId, entryTime, dt, holdingMinutes, tradeLogRet, tradeRealRet, position)
+        position = 0; entryPriceRatio = 0.0; entryPrice1 = 0.0; entryPrice2 = 0.0; holdingMinutes = 0; forceExit = false; tradeId = 0
+    }
+    // Entry - exact replication of original logic
+    else if (position == 0 && !isVoid(signal) && (signal == 1 || signal == -1)) {
+        rollCheck = iif(isVoid(msg.is_roll_date_1[0]), false, msg.is_roll_date_1[0]) || iif(isVoid(msg.is_roll_date_2[0]), false, msg.is_roll_date_2[0])
+        gapCheck = isVoid(config[`maxGapDays]) || isVoid(msg.gap_days_to_next[0]) || msg.gap_days_to_next[0] <= config[`maxGapDays]
+        
+        if (!rollCheck && gapCheck) {
+            position = signal; entryTime = dt; tradeCounter += 1; tradeId = tradeCounter
+            entryPriceRatio = position * (log(open1) - log(open2))
+            entryPrice1 = open1; entryPrice2 = open2; holdingMinutes = 0
+            
+            logRet = position * (log(close1) - log(close2)) - entryPriceRatio  
+            realRet = position * ((close1/open1) - (close2/open2))
+        }
+    }
+    // Exit - exact replication of original logic
+    else if (position != 0 && !isVoid(signal) && signal == 0) {
+        exitRatio = position * (log(exit1) - log(exit2))
+        tradeLogRet = exitRatio - entryPriceRatio
+        tradeRealRet = position * ((exit1/entryPrice1) - (exit2/entryPrice2))
+        
+        logRet = position * ((log(exit1) - log(exit2)) - (log(prevClose1) - log(prevClose2)))  
+        realRet = position * ((exit1/prevClose1) - (exit2/prevClose2))
+        
+        insert into trades values(tradeId, entryTime, dt, holdingMinutes, tradeLogRet, tradeRealRet, position)
+        position = 0; entryPriceRatio = 0.0; entryPrice1 = 0.0; entryPrice2 = 0.0; holdingMinutes = 0; tradeId = 0
+    }
+    // Holding
+    else if (position != 0) {
+        logRet = position * ((log(close1) - log(close2)) - (log(prevClose1) - log(prevClose2)))
+        realRet = position * ((close1/prevClose1) - (close2/prevClose2))
+        
+        // Stop loss check
+        if (!isVoid(config[`stopLoss])) {
+            cumRet = position * ((close1/entryPrice1) - (close2/entryPrice2))
+            if (cumRet <= -config[`stopLoss]) forceExit = true
+        }
+        
+        // Max holding check  
+        if (!isVoid(config[`maxHolding]) && holdingMinutes + 1 >= config[`maxHolding]) forceExit = true
+        
+        // Roll/gap exit at 14:58
+        t = time(dt)
+        if (hour(t) == 14 && minute(t) == 58) {
+            rollExit = iif(isVoid(msg.is_roll_date_1[0]), false, msg.is_roll_date_1[0]) || iif(isVoid(msg.is_roll_date_2[0]), false, msg.is_roll_date_2[0])
+            gapExit = !isVoid(config[`maxGapDays]) && !isVoid(msg.gap_days_to_next[0]) && msg.gap_days_to_next[0] > config[`maxGapDays]
+            if (rollExit || gapExit) forceExit = true
+        }
+        
+        holdingMinutes += 1
+    }
+    
+    insert into results values(dt, position, logRet, realRet, tradeId)
+    prevClose1 = close1; prevClose2 = close2
+}
+
+def getMetrics() {
+    if (results.size() == 0) return dict(`totalReturn`sharpe`maxDD, [0.0, NULL, 0.0])
+    
+    returns = exec realReturn from results where realReturn != NULL
+    if (returns.size() == 0) return dict(`totalReturn`sharpe`maxDD, [0.0, NULL, 0.0])
+    
+    // Basic metrics
+    annualFactor = sqrt(345 * 252)  // Minutes per day * trading days
+    meanRet = avg(returns)
+    stdRet = std(returns)
+    sharpe = iif(stdRet > 0, (meanRet/stdRet) * annualFactor, NULL)
+    
+    // Equity and drawdown
+    equity = cumprod(1 + returns)
+    maxDD = min(equity / cummax(equity) - 1)
+    totalRet = equity[equity.size()-1] - 1
+    
+    // Trade metrics  
+    if (trades.size() > 0) {
+        tradeRets = exec realReturn from trades
+        numTrades = trades.size()
+        wins = sum(tradeRets > 0)
+        winRate = wins / numTrades
+        avgRet = avg(tradeRets)
+        profitFactor = sum(tradeRets[tradeRets>0]) / abs(sum(tradeRets[tradeRets<0]))
+    } else {
+        numTrades = 0; winRate = NULL; avgRet = NULL; profitFactor = NULL
+    }
+    
+    return dict(`totalReturn`sharpe`maxDD`numTrades`winRate`avgTradeRet`profitFactor, 
+               [totalRet, sharpe, maxDD, numTrades, winRate, avgRet, profitFactor])
+}
+
+// Initialization
+def reset() {
+    position = 0
+    entryPriceRatio = 0.0; entryPrice1 = 0.0; entryPrice2 = 0.0
+    entryTime = timestamp(NULL); holdingMinutes = 0; forceExit = false; tradeId = 0; tradeCounter = 0
+    prevClose1 = 0.0; prevClose2 = 0.0
+    
+    // Reset signal buffer - critical!
+    signalBuffer = array(DOUBLE, 0)
+    
+    results = table(100:0, `datetime`position`logReturn`realReturn`tradeId, [DATETIME,INT,DOUBLE,DOUBLE,INT])
+    trades = table(100:0, `tradeId`entryTime`exitTime`duration`logReturn`realReturn`direction, [INT,DATETIME,DATETIME,INT,DOUBLE,DOUBLE,INT])
+}
+
+// Usage: 
+// reset()
+// config[`stopLoss] = 0.02; config[`lag] = 1  // CRITICAL: lag must match original backtest!
+// subscribeTable("stream_table", "handler", backtestHandler, msgAsTable=true, batchSize=1)
+// metrics = getMetrics()
