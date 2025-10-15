@@ -22,13 +22,13 @@ share streamTable(1000:0, Y_clean.schema().colDefs.name, Y_clean.schema().colDef
 
 try{dropSharedTables("sig1_stream_tmp1")}catch(ex){}
 share streamTable(1000:0, 
-`datetime`parent_order_book_id`seq`order_book_id`open`close`is_roll_date`scheduled_roll_date,
-[DATETIME,SYMBOL,INT,STRING,STRING,STRING,BOOL,DATE]) as sig1_stream_tmp1
+`datetime`parent_order_book_id`seq`order_book_id`open`close`is_roll_date`scheduled_roll_date`gap_days_to_next,
+[DATETIME,SYMBOL,INT,STRING,STRING,STRING,BOOL,DATE,STRING]) as sig1_stream_tmp1
 
 try{dropSharedTables("sig1_stream_tmp2")}catch(ex){}
 share streamTable(1000:0, 
-`datetime`parent_order_book_id`seq`order_book_id`open`close`is_roll_date`scheduled_roll_date,
-[DATETIME,SYMBOL,INT,STRING,DOUBLE[],DOUBLE[],BOOL,DATE]) as sig1_stream_tmp2
+`datetime`parent_order_book_id`seq`order_book_id`open`close`is_roll_date`scheduled_roll_date`gap_days_to_next,
+[DATETIME,SYMBOL,INT,STRING,DOUBLE[],DOUBLE[],BOOL,DATE,INT[]]) as sig1_stream_tmp2
 
 try{dropStreamEngine(`alpha11)}catch(ex){}
 sig1_engine_cs = createCrossSectionalEngine(
@@ -40,7 +40,8 @@ sig1_engine_cs = createCrossSectionalEngine(
         concat(string(open), ","),
         concat(string(close), ","),
         first(is_roll_date),
-        first(scheduled_roll_date)
+        first(scheduled_roll_date),
+        concat(string(gap_days_to_next), ",")
     ]>,
     dummyTable=ctp_data, outputTable=sig1_stream_tmp1, 
     useSystemTime=false,
@@ -59,6 +60,10 @@ def cs_to_row(msg, ttl_count){
         result, `close, 
         array(DOUBLE[],0).append!((select double(split(close, ',')) as split from result)['split'])
     )
+    replaceColumn!(
+        result, `gap_days_to_next, 
+        array(INT[],0).append!((select int(split(gap_days_to_next, ',')) as split from result)['split'])
+    )
     sig1_stream_tmp2.append!(result)
 }
 
@@ -76,7 +81,7 @@ def compute_rolling_zscore_grouped(close, window){
 // z_series = compute_rolling_zscore_grouped(result, window)
 
 def nested_generate_trading_signals_reversion(z, 
-                                                mutable current_position,
+                                                mutable cur_pos,
                                                 entry_threshold_long,
                                                 entry_threshold_short,
                                                 exit_threshold_long,
@@ -85,36 +90,36 @@ def nested_generate_trading_signals_reversion(z,
     signal = 0  
     
     // ENTRY logic
-    if (current_position == 0){
+    if (cur_pos == 0){
         if (z < entry_threshold_long){
-            current_position = 1  // Enter long
+            cur_pos = 1  // Enter long
             signal = 1
         } else {
             if (z > entry_threshold_short){
-                current_position = -1  // Enter short
+                cur_pos = -1  // Enter short
                 signal = -1
             } else {
-                signal = current_position
+                signal = cur_pos
             }
         }
     }
     
     // EXIT logic
-    if (current_position == 1) {
+    if (cur_pos == 1) {
         if (z > exit_threshold_long){
-            current_position = 0
+            cur_pos = 0
             signal = 0
         } else {
-            signal = current_position
+            signal = cur_pos
         }
     }
     
-    if (current_position == -1) {
+    if (cur_pos == -1) {
         if (z < exit_threshold_short){
-            current_position = 0
+            cur_pos = 0
             signal = 0
         } else {
-            signal = current_position
+            signal = cur_pos
         }
     }
     
@@ -122,7 +127,7 @@ def nested_generate_trading_signals_reversion(z,
 }
 
 def generate_trading_signals_reversion(z_series, 
-                                        mutable current_position,
+                                        mutable cur_pos,
                                         entry_threshold_long=-1.0,
                                         entry_threshold_short=1.0,
                                         exit_threshold_long=0.0,
@@ -131,7 +136,7 @@ def generate_trading_signals_reversion(z_series,
     
     return each(nested_generate_trading_signals_reversion, 
                 z_series.nullFill(0),
-                current_position,
+                cur_pos,
                 entry_threshold_long,
                 entry_threshold_short,
                 exit_threshold_long,
@@ -142,8 +147,11 @@ def generate_trading_signals_reversion(z_series,
 
 try{dropSharedTables("sig1_stream_tmp3")}catch(ex){}
 share streamTable(1000:0, 
-`datetime`order_book_id`open`close`is_roll_date`scheduled_roll_date`signal,
-[DATETIME,STRING,DOUBLE[],DOUBLE[],BOOL,DATE,INT]) as sig1_stream_tmp3
+`datetime`order_book_id`open`close`is_roll_date`scheduled_roll_date`gap_days_to_next`signal,
+[DATETIME,STRING,DOUBLE[],DOUBLE[],BOOL,DATE,INT[],INT]) as sig1_stream_tmp3
+
+
+//TODO I need to make this createReactiveStateEngine per group
 
 def sig1_handler(msg, window){
     result = select datetime, order_book_id, open, close, is_roll_date, scheduled_roll_date from msg
@@ -165,6 +173,184 @@ execution_config['exit_execution_price'] = 'open'
 execution_config['max_gap_days'] = 2
 execution_config['max_holding_minutes'] = NULL
 execution_config['stop_loss_pct'] = 0.002
+
+state_dict = dict(STRING, ANY)
+state_dict["current_position"] = 0
+state_dict["current_trade_id"] = 0
+state_dict["entry_price_ratio"] = NULL
+state_dict["entry_price_tuple"] = NULL
+state_dict["entry_time"] = NULL
+state_dict["holding_minutes"] = 0
+state_dict["force_exit"] = false
+
+trade_data = dict(STRING, ANY)
+trade_data["trade_log_returns"] = ()
+trade_data["trade_log_returns"].append!(12)
+trade_data["trade_log_returns"]
+
+trade_data = dict(STRING, ANY)
+trade_data["trade_log_returns"] = ()
+trade_data["trade_log_returns"] = trade_data["trade_log_returns"].append!(12)
+trade_data["trade_log_returns"]
+
+typestr(trade_data["trade_log_returns"])
+typestr(())
+trade_data["trade_log_returns"].append!(12)
+
+def run_backtest_loop(execution_config, merge_df, prev_merge_df, mutable state_dict){
+
+    strategy_log_returns = []
+    strategy_real_returns = []   
+    
+    trade_log_returns = []
+    trade_real_returns = []     
+    entry_times = []
+    exit_times = []
+    holding_durations = []
+    
+    entry_price_1 = merge_df.[execution_config["entry_execution_price"]][0][0]
+    entry_price_2 = merge_df.[execution_config["entry_execution_price"]][0][1]
+    close_1 = merge_df.close[0]
+    close_2 = merge_df.close[1]
+    prev_close_1 = prev_merge_df.close[0]
+    prev_close_2 = prev_merge_df.close[1]
+    
+    if (state_dict["force_exit"] and state_dict["current_position"] != 0){
+        exit_price_1 = merge_df.[execution_config["exit_execution_price"]][0][0]
+        exit_price_2 = merge_df.[execution_config["exit_execution_price"]][0][1]
+
+        exit_price_ratio = state_dict["current_position"] * (log(exit_price_1) - log(exit_price_2))
+        trade_log_returns = exit_price_ratio - state_dict["entry_price_ratio"]
+
+        // Compute and track real trade return
+        entry_1, entry_2 = state_dict["entry_price_tuple"]
+        trade_real_returns = state_dict["current_position"] * ((exit_price_1 / entry_1) - (exit_price_2 / entry_2))
+
+        strategy_log_returns = state_dict["current_position"] * (
+            (log(exit_price_1) - log(exit_price_2)) -
+            (log(prev_close_1) - log(prev_close_2))
+        )
+
+        strategy_real_returns = state_dict["current_position"] * (
+            (exit_price_1 / prev_close_1) - (exit_price_2 / prev_close_2)
+        )
+
+        exit_times = datetime
+        holding_durations = state_dict["holding_minutes"]
+
+        //Reset state
+        state_dict["current_position"] = 0
+        state_dict["current_trade_id"] = NULL
+        state_dict["entry_price_ratio"] = NULL
+        state_dict["entry_price_tuple"] = NULL  //Reset tuple here
+        state_dict["entry_time"] = NULL
+        state_dict["holding_minutes"] = 0
+        state_dict["force_exit"] = false //Clear the flag
+        
+    }else{
+        //--- Entry ---
+        if (
+            state_dict["current_position"] == 0 and signal in [1, -1] and not is_roll_date and not (
+                execution_config["max_gap_days"] is not NULL 
+                and gap_days_to_next > execution_config["max_gap_days"]
+            )
+        ){
+            //Reset state
+            state_dict["current_position"] = signal
+            state_dict["current_trade_id"] += 1
+            state_dict["entry_price_ratio"] = state_dict["current_position"] * (log(entry_price_1) - log(entry_price_2))
+            state_dict["entry_price_tuple"] = (entry_price_1, entry_price_2)
+            entry_times = datetime
+            state_dict["holding_minutes"] = 0
+
+            //Log return from entry to close of this bar
+            strategy_log_returns = state_dict["current_position"] * (log(close_1) - log(close_2)) - state_dict["entry_price_ratio"]
+
+            //Real return from entry to close of this bar
+            strategy_real_returns = state_dict["current_position"] * ((close_1 / entry_price_1) - (close_2 / entry_price_2))
+            
+        } else{
+            //--- Exit ---
+            if (state_dict["current_position"] != 0 and signal == 0){
+                exit_price_1 = merge_df.[execution_config["exit_execution_price"]][0][0]
+                exit_price_2 = merge_df.[execution_config["exit_execution_price"]][0][1]
+
+                exit_price_ratio = state_dict["current_position"] * (log(exit_price_1) - log(exit_price_2))
+                trade_log_returns = exit_price_ratio - state_dict["entry_price_ratio"]
+
+                //--- Real Return from Entry to Exit ---
+                entry_1, entry_2 = state_dict["entry_price_tuple"]
+                trade_real_returns = state_dict["current_position"] * ((exit_price_1 / entry_1) - (exit_price_2 / entry_2))
+
+                strategy_log_returns = state_dict["current_position"] * (
+                    (log(exit_price_1) - log(exit_price_2)) -
+                    (log(prev_close_1) - log(prev_close_2))
+                )
+
+                strategy_real_returns = state_dict["current_position"] * (
+                    (exit_price_1 / prev_close_1) - (exit_price_2 / prev_close_2)
+                )
+
+                exit_times = datetime
+                holding_durations = state_dict["holding_minutes"]
+
+                //Reset state
+                state_dict["current_position"] = 0
+                state_dict["current_trade_id"] = NULL
+                state_dict["entry_price_ratio"] = NULL
+                state_dict["entry_price_tuple"] = NULL
+                state_dict["entry_time"] = NULL
+                state_dict["holding_minutes"] = 0
+            } else{
+                //--- Holding ---
+                if (state_dict["current_position"] != 0){
+                    //--- Per-bar PnL (log + real) ---
+                    strategy_log_returns = state_dict["current_position"] * (
+                        (log(close_1) - log(close_2)) -
+                        (log(prev_close_1) - log(prev_close_2))
+                    )
+
+                    strategy_real_returns = state_dict["current_position"] * (
+                        (close_1 / prev_close_1) - (close_2 / prev_close_2)
+                    )
+
+                    //--- Check Stop Loss (real cumulative return from entry) ---
+                    if (execution_config["stop_loss_pct"] is not NULL and state_dict["entry_price_tuple"] is not NULL){
+                        entry_1, entry_2 = state_dict["entry_price_tuple"]
+                        cumulative_real_return = state_dict["current_position"] * ((close_1 / entry_1) - (close_2 / entry_2))
+                        if (cumulative_real_return <= -execution_config["stop_loss_pct"]){state_dict["force_exit"] = true}
+                    }
+
+                    //--- Check Max Holding Duration ---
+                    if (
+                        execution_config["max_holding_minutes"] is not NULL and (state_dict["holding_minutes"] + 1 >= execution_config["max_holding_minutes"])
+                    ){state_dict["force_exit"] = true}
+
+                    //--- Forced Exit on Roll Date at 14:58 ---
+                    if (
+                        is_roll_date_2 and datetime.time() == 14 and datetime.time() == 58
+                    ){state_dict["force_exit"] = true}
+
+                    //--- Forced Exit on Big Gap Day at 14:58 ---
+                    if (
+                        execution_config["max_gap_days"] is not NULL and
+                        gap_days_to_next > execution_config["max_gap_days"] and
+                        datetime.time() == 14 and datetime.time() == 58
+                    ){state_dict["force_exit"] = true}
+                    state_dict["holding_minutes"] += 1
+                }else{
+                    //Flat position = no return
+                    strategy_log_returns = 0.0
+                    strategy_real_returns = 0.0
+                }
+            }
+        }
+    }
+    
+}
+
+merge_df = select * from sig1_stream_tmp3
+merge_df[0].['open'][0][0]
 
 
 
