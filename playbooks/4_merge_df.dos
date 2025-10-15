@@ -1,0 +1,39 @@
+Y_filtered = select * from loadTable("dfs://rq_cn_futures_minute_Y", "k_minute") where monthOfYear(maturity_month) in [1,5,9]
+M_filtered = select * from loadTable("dfs://rq_cn_futures_minute_M", "k_minute") where monthOfYear(maturity_month) in [1,5,9]
+
+
+bt_start_time = min(min(Y_filtered.datetime, M_filtered.datetime))
+bt_end_time = max(max(Y_filtered.datetime, M_filtered.datetime))
+
+
+def nested_get_dominant_159(today, parent_symbol){
+    proper_month = case 
+        when monthOfYear(today) in [12,1,2,3] then "05"
+        when monthOfYear(today) in [4,5,6,7] then "09"
+        when monthOfYear(today) in [8,9,10,11] then "01"
+    end
+    return parent_symbol + string(year(today))[2:] + proper_month
+}
+def get_dominant_159(today, parent_symbol){
+    return each(nested_get_dominant_159, today, parent_symbol)
+}
+
+update Y_filtered set dominant_contract = get_dominant_159(datetime, parent_order_book_id)
+Y_clean = (select * from Y_filtered where order_book_id == dominant_contract).sortBy!(`datetime)
+update M_filtered set dominant_contract = get_dominant_159(datetime, parent_order_book_id)
+M_clean = (select * from M_filtered where order_book_id == dominant_contract).sortBy!(`datetime)
+
+update Y_clean set gap_days_to_next = temporalDiff(temporalAdd(datetime, 1, "DCE"), datetime)/86400
+update M_clean set gap_days_to_next = temporalDiff(temporalAdd(datetime, 1, "DCE"), datetime)/86400
+
+update Y_clean set scheduled_roll_date=temporalAdd(date(
+    temporalAdd(maturity_month, -1, 'M')
+),-1,"DCE")
+update M_clean set scheduled_roll_date=temporalAdd(date(
+    temporalAdd(maturity_month, -1, 'M')
+),-1,"DCE")
+
+update Y_clean set is_roll_date=(date(datetime)==date(scheduled_roll_date))
+update M_clean set is_roll_date=(date(datetime)==date(scheduled_roll_date))
+
+// use scheduled_roll_date as contract_pair_group instead 

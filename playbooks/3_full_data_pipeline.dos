@@ -1,0 +1,405 @@
+
+marketTBCapacity=300000
+ctpSubType = "marketData"
+ctpSubTBName = "ctpMarketDataStream"
+
+
+
+def ctpConfig(ip, port){
+    config={
+        "OutputElapsed": true, // 将数据进入插件，到插入流表前的时间间隔作为一个字段置于表末尾，类型为 LONG。perPenetrationTime, nanosecond (not the latency we are looking at)
+        "ReceivedTime": true, // 将接收到数据的时间作为一个字段置于表末尾，类型为 NANOTIMESTAMP。默认为 true。receivedTime
+        "ConcatTime": true // 将 UpdateTime 和 UpdateMillisec 字段合并为一个 tradeTime 字段置于表末尾，类型为 TIME
+    }
+    return ctp::connect(ip, port, config)
+}
+
+conn = ctpConfig("180.166.103.21", port = 55213)
+tb = ctp::getSchema(conn, ctpSubType) 
+
+ids = ["ad2512", "CJ512", "CY512", "PF512", "PK512", "PR512", "PX512", "SA512", "SH512", "UR512", "TA512", "FG512", "SF512", "SM512", "MA512", "sc2512", "bu2512", "T2512", "TF2512", "TL2512"]
+
+
+cols_exchange_times = `open_auction_start`open_auction_end`special_open_auction_start`special_open_auction_end`close_auction_start`close_auction_end`special_close_auction_start`special_close_auction_end`continuous_start`continuous_end`special_continous_start`special_continous_end`timezone
+cols_exchange_times_type = [TIME[],TIME[],TIME[],TIME[],TIME[],TIME[],TIME[],TIME[],TIME[],TIME[],TIME[],TIME[],STRING]
+cols_isNull_check = ["ExchangeID", "continuous_start", "continuous_end"]
+cols_trading = ["ExchangeID", "InstrumentID", "VolumeMultiple", "PriceTick", "MaxLimitOrderVolume", "UnderlyingInstrID", "parent_id", "currency","DeliveryYear","DeliveryMonth"]
+id_universe = select * from universe where InstrumentID in ids
+
+
+ss_ee_map = <select toArray(InstrumentID) as symb_list, ExchangeID, _$$cols_exchange_times from id_universe 
+        group by ExchangeID, _$$cols_exchange_times>.eval()
+
+
+// change the exchange times to time []
+for (col in cols_exchange_times){
+    if (col == 'timezone'){continue}
+    replaceColumn!(
+        id_universe, col, 
+        <select array(TIME[], 0).append!(time((_$col).split(","))) from id_universe>.eval()['append!']
+    )   
+}
+id_universe = trim(id_universe)
+
+
+
+if (not existsStreamTable(ctpSubTBName)){
+    enableTableShareAndPersistence(
+        table=streamTable(marketTBCapacity:0, tb.name, tb.typeString), 
+        tableName=ctpSubTBName,
+        cacheSize=marketTBCapacity,
+    preCache=0)
+};go
+
+snapshot_coldef_name = `InstrumentID`exchange_id`unified_code`delivery_year`delivery_month`volume_mul`price_tick`trade_date`last_price`open_price`high_price`low_price`close_price`volume`turnover`open_interest`pre_settlement_price`pre_close_price`pre_open_interest`pre_delta`upper_limit_price`lower_limit_price`bid_price`bid_volume`ask_price`ask_volume`trade_time`open_auction_start`open_auction_end`special_open_auction_start`special_open_auction_end`close_auction_start`close_auction_end`special_close_auction_start`special_close_auction_end`continuous_start`continuous_end`special_continous_start`special_continous_end`timezone`data_time`utc_data_time`tick_type_l1`tick_type_l2
+snapshot_coldef_type = [SYMBOL,STRING,STRING,INT,INT,INT,DOUBLE,DATE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,INT,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE[],INT[],DOUBLE[],INT[],TIME,TIME[],TIME[],TIME[],TIME[],TIME[],TIME[],TIME[],TIME[],TIME[],TIME[],TIME[],TIME[],STRING,TIMESTAMP,TIMESTAMP,STRING,STRING]
+bar_coldef_name = `data_time`InstrumentID`trade_date`open`high`low`close`volume`open_interest`turnover`pre_settlement_price`pre_close_price`pre_open_interest`pre_delta`upper_limit_price`lower_limit_price`first_bid_price`first_ask_price`first_bid_volume`first_ask_volume`last_bid_price`last_ask_price`last_bid_volume`last_ask_volume`avg_spread
+bar_coldef_type = [TIMESTAMP,SYMBOL,DATE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,INT,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,INT,INT,DOUBLE,DOUBLE,INT,INT,DOUBLE]
+
+
+snapshot_table_name = "ctpSnapshot"
+min_table_name = "ctpMin"
+day_table_name = "ctpDay"
+if (not existsStreamTable(snapshot_table_name)){
+    enableTableShareAndPersistence(
+        table=streamTable(marketTBCapacity:0, snapshot_coldef_name, snapshot_coldef_type), 
+        tableName=snapshot_table_name,
+        cacheSize=marketTBCapacity,
+    preCache=0)
+};go
+if (not existsStreamTable(min_table_name)){
+    enableTableShareAndPersistence(
+        table=streamTable(int(marketTBCapacity/10):0, bar_coldef_name, bar_coldef_type), 
+        tableName=min_table_name,
+        cacheSize=int(marketTBCapacity/10),
+    preCache=0)
+};go
+if (not existsStreamTable(day_table_name)){
+    enableTableShareAndPersistence(
+        table=streamTable(int(marketTBCapacity/100):0, bar_coldef_name, bar_coldef_type), 
+        tableName=day_table_name,
+        cacheSize=int(marketTBCapacity/100),
+    preCache=0)
+};go
+
+def nested_within_timepairs(tradeTime, list_of_start, list_of_end){
+    for (i in 0:size(list_of_start)){
+        startTime = list_of_start[i]
+        endTime = list_of_end[i]
+        // print(tradeTime, startTime, endTime)
+        if (endTime<startTime){ // overnight
+            if (tradeTime>=startTime or tradeTime<=endTime){
+                return true
+            }
+        } else {
+            if (tradeTime>=startTime and tradeTime<=endTime){
+                return true
+            }
+        }
+    }
+    return false
+}
+
+def within_timepairs(tradeTime, list_of_start, list_of_end){
+    return each(nested_within_timepairs, tradeTime, list_of_start, list_of_end)
+}
+// nested_within_timepairs(22:00:20, [20:00:00,22:00:00], [20:30:00,22:30:00])
+// nested_within_timepairs(14:24:13.500, 
+// [21:00:00.000, 09:00:00.000, 10:30:00.000, 13:30:00.000],
+// [01:00:00.000, 10:15:00.000, 11:30:00.000, 15:00:00.000])
+ 
+// within_timepairs([21:00:10, 22:00:20], 
+// [[20:00:00,22:00:00], [22:00:00]],
+// [[20:30:00,22:30:00], [22:30:00]])
+// within_timepairs([21:00:10, 22:00:20], 
+// [[20:00:00,22:00:00], []],
+// [[20:30:00,22:30:00], []])
+
+
+def null_align(vec1, vec2, fill_value, direction='front'){
+    /*
+    This function is used to make vec1 the same length as vec2 with fill_value
+    direction must be front or back, meaning the original values will be filled in which direction
+     */
+    result = take(fill_value, size(vec2))
+    if (direction == "front"){
+        result[0:size(vec1)] = vec1
+    } else {
+        if (direction == "back"){
+            result[size(result) - size(vec1):] = vec1
+        } else {
+            throw "Wrong direction values"
+        }
+    }
+    return result
+}
+// null_align(1,1 2 3, int(NULL), 'back')
+
+def nested_time_compare(vec1, vec2, direction='front'){
+    /*
+    This function tries to compare the earliest or latest time of continous and open/close auctions
+     */
+    if (direction=='front'){
+        return minIgnoreNull(null_align(vec1, vec2, time(NULL), direction), vec2)
+    } else {
+        if (direction=='back'){
+            return maxIgnoreNull(null_align(vec1, vec2, time(NULL), direction), vec2)
+        } else {
+            throw "Wrong direction values"
+        }
+    }
+}
+
+def time_compare(vec1, vec2, direction='front'){
+    return each(nested_time_compare, vec1, vec2, direction)
+}
+// nested_time_compare(08:55:00.000, [09:00:00.000,10:30:00.000,13:30:00.000])
+// time_compare([08:55:00.000,08:55:00.000], [[09:00:00.000,10:30:00.000,13:30:00.000],[09:00:00.000,10:30:00.000,13:30:00.000]])
+// time_compare(time(NULL),[10:15:00.000,11:30:00.000,15:00:00.000], direction='back')
+
+
+
+
+def build_ctp_snapshot(msg, snapshot_table_name, id_universe, cols_trading, cols_exchange_times, isLive){
+    tmp = <select _$$cols_trading, _$$cols_exchange_times from id_universe>.eval()
+    ctpProcess = <select
+                    InstrumentID as InstrumentID,
+                    tmp.ExchangeID as exchange_id,
+                    msg.InstrumentID + "." + tmp.ExchangeID as unified_code,
+                    tmp.DeliveryYear as delivery_year,
+                    tmp.DeliveryMonth as delivery_month,
+                    tmp.VolumeMultiple as volume_mul,
+                    tmp.PriceTick as price_tick,
+                    TradingDay as trade_date,
+                    LastPrice as last_price,
+                    OpenPrice as open_price,
+                    HighestPrice as high_price,
+                    LowestPrice as low_price,
+                    ClosePrice as close_price,
+                    Volume as volume,
+                    Turnover as turnover,
+                    OpenInterest as open_interest,
+                    PreSettlementPrice as pre_settlement_price,
+                    PreClosePrice as pre_close_price,
+                    PreOpenInterest as pre_open_interest,
+                    PreDelta as pre_delta,
+                    UpperLimitPrice as upper_limit_price,
+                    LowerLimitPrice as lower_limit_price,
+                    fixedLengthArrayVector(BidPrice1, BidPrice2, BidPrice3, BidPrice4, BidPrice5)as bid_price,
+                    fixedLengthArrayVector(BidVolume1, BidVolume2, BidVolume3, BidVolume4, BidVolume5) as bid_volume,
+                    fixedLengthArrayVector(AskPrice1, AskPrice2, AskPrice3, AskPrice4, AskPrice5) as ask_price,
+                    fixedLengthArrayVector(AskVolume1, AskVolume2, AskVolume3, AskVolume4, AskVolume5) as ask_volume,
+                    tradeTime as trade_time,
+                    _$$cols_exchange_times
+                from lj(msg, tmp, `InstrumentID, `InstrumentID)
+                >.eval()
+                
+    ctpProcess = select * from ctpProcess where within_timepairs(
+                    trade_time, 
+                    time_compare(open_auction_start, continuous_start, direction='front'),
+                    time_compare(close_auction_end, continuous_end, direction='back')
+    ) // make sures only within the time range
+    
+
+    if (isLive == true){
+        now_day = date(now())
+        update ctpProcess set trade_date = iif(trade_time > 20:00:00.000, each(temporalAdd{now_day, 1}, exchange_id), now_day)
+        update ctpProcess set data_time = temporalParse(string(now_day) + " " + string(trade_time), "yyyy.MM.dd HH:mm:ss.SSS")
+        update ctpProcess set utc_data_time = temporalAdd(data_time, -8, "H")
+    } else {
+        // update ctpProcess set action_date=temporalAdd(trade_date, -1, `DCE) where trade_time>=20:55:00.000 and exchange_id="DCE"
+        // update ctpProcess set action_date=temporalAdd(trade_date, -1, `DCE)+1 where trade_time<=02:30:00.000 and exchange_id="DCE" 
+        update ctpProcess set trade_date=temporalAdd(trade_date, 1, `CZCE) where trade_time>=20:55:00.000 and exchange_id="CZC" 
+        update ctpProcess set data_time = temporalParse(string(trade_date) + " " + string(trade_time), "yyyy.MM.dd HH:mm:ss.SSS")
+        update ctpProcess set utc_data_time = temporalAdd(data_time, -8, "H")
+    }
+    
+    update ctpProcess set tick_type_l1 = case
+    when within_timepairs(trade_time, open_auction_start, open_auction_end) or within_timepairs(trade_time, close_auction_start, close_auction_end) then "auction"
+    when within_timepairs(trade_time, continuous_start, continuous_end) then "continuous"
+    else "error"
+    end
+    
+    update ctpProcess set tick_type_l2 = case
+    when within_timepairs(trade_time, open_auction_start, open_auction_end) and within_timepairs(trade_time, special_open_auction_start, special_open_auction_end) then "no_input"
+    when within_timepairs(trade_time, open_auction_start, open_auction_end) and !within_timepairs(trade_time, special_open_auction_start, special_open_auction_end) then "normal"
+    when within_timepairs(trade_time, close_auction_start, close_auction_end) and within_timepairs(trade_time, special_close_auction_start, special_close_auction_end) then "no_input"
+    when within_timepairs(trade_time, close_auction_start, close_auction_end) and !within_timepairs(trade_time, special_close_auction_start, special_close_auction_end) then "normal"
+    when within_timepairs(trade_time, continuous_start, continuous_end) and within_timepairs(trade_time, special_continous_start, special_continous_end) then "no_input"
+    when within_timepairs(trade_time, continuous_start, continuous_end) and !within_timepairs(trade_time, special_continous_start, special_continous_end) then "normal"
+    else "error"
+    end
+    
+    objByName(snapshot_table_name).append!(ctpProcess)
+}
+
+subscribeTable(
+    tableName=ctpSubTBName, 
+    actionName=ctpSubTBName + "Std", 
+    handler=build_ctp_snapshot{, snapshot_table_name, id_universe, cols_trading, cols_exchange_times,isLive=true}, 
+    msgAsTable=true
+    // ,batchSize=10000, 
+    // throttle=0.001, 
+    // hash=0, 
+    // reconnect=true
+)
+
+def build_ctp_minute(snapshot_table_name,min_table_name,ss_list,ee_list,type_number,symbol_list,nSec=60){
+    tse_min_metrics=<[
+        last(trade_date) as trade_date, 
+        firstNot(last_price, 0.0) as open,
+        max(last_price, high_price) as high,
+        min(last_price, low_price) as low, 
+        lastNot(last_price, 0.0) as close, 
+        last(volume)-first(volume) as volume, 
+        last(open_interest) as open_interest, 
+        last(turnover) - first(turnover) as turnover, 
+        last(pre_settlement_price) as pre_settlement_price, 
+        last(pre_close_price) as pre_close_price, 
+        last(pre_open_interest) as pre_open_interest, 
+        last(pre_delta) as pre_delta, 
+        last(upper_limit_price) as upper_limit_price, 
+        last(lower_limit_price) as lower_limit_price, 
+        first(bid_price[0]) as first_bid_price, 
+        first(ask_price[0]) as first_ask_price, 
+        first(bid_volume[0]) as first_bid_volume, 
+        first(ask_volume[0]) as first_ask_volume, 
+        last(bid_price[0]) as last_bid_price, 
+        last(ask_price[0]) as last_ask_price, 
+        last(bid_volume[0]) as last_bid_volume, 
+        last(ask_volume[0]) as last_ask_volume, 
+        avg(ask_price[0] - bid_price[0]) as avg_spread
+    ]>
+    fill_min=[
+        'ffill','null','null','null','null','null','null','null',
+        'ffill','ffill','ffill','ffill','ffill','ffill',
+        'null','null','null','null','null','null','null','null','null'
+        ]
+    tse_min = createDailyTimeSeriesEngine(
+        name="tse_min_"+string(type_number), 
+        windowSize=1000*nSec, step=1000*nSec, forceTriggerTime=1000*nSec,
+        metrics=tse_min_metrics,  
+        dummyTable=objByName(snapshot_table_name), 
+        outputTable=objByName(min_table_name),
+        timeColumn=`data_time, 
+        keyColumn=`InstrumentID,
+        closed=`right,forceTriggerTime=0,forceTriggerSessionEndTime=0,keyPurgeDaily=false,fill=fill_min,
+        sessionBegin=temporalAdd(ss_list,-1,'m'), 
+        sessionEnd=ee_list
+    )
+    subscribeTable(,
+        tableName=snapshot_table_name, 
+        actionName="tse_min_"+string(type_number), 
+        handler=tableInsert{tse_min}, 
+        filter=symbol_list,
+        msgAsTable=true
+    )
+}
+
+def end_minus_start_time_seconds(startT, endT){
+    return iif(endT-startT<0, (endT-startT+12:00:00.000+12:00:00.000) / 1000, (endT-startT)/1000)
+}
+def build_ctp_day(snapshot_table_name,day_table_name,ss_list,ee_list,type_number,symbol_list){ 
+    tse_day_metrics=<[
+        last(trade_date) as trade_date, 
+        lastNot(open_price, 0.0) as open,
+        lastNot(high_price, 0.0) as high,
+        lastNot(low_price, 0.0) as low, 
+        lastNot(last_price, 0.0) as close, 
+        last(volume) as volume, 
+        last(open_interest) as open_interest, 
+        last(turnover) as turnover, 
+        last(pre_settlement_price) as pre_settlement_price, 
+        last(pre_close_price) as pre_close_price, 
+        last(pre_open_interest) as pre_open_interest, 
+        last(pre_delta) as pre_delta, 
+        last(upper_limit_price) as upper_limit_price, 
+        last(lower_limit_price) as lower_limit_price, 
+        first(bid_price[0]) as first_bid_price, 
+        first(ask_price[0]) as first_ask_price, 
+        first(bid_volume[0]) as first_bid_volume, 
+        first(ask_volume[0]) as first_ask_volume, 
+        last(bid_price[0]) as last_bid_price, 
+        last(ask_price[0]) as last_ask_price, 
+        last(bid_volume[0]) as last_bid_volume, 
+        last(ask_volume[0]) as last_ask_volume, 
+        avg(ask_price[0] - bid_price[0]) as avg_spread
+    ]>
+    s_start, e_end = ss_list[0], ee_list[int(size(ee_list)-1)]
+    duration = end_minus_start_time_seconds(s_start, e_end)
+    tse_day = createDailyTimeSeriesEngine(
+        name="tse_day_"+string(type_number), 
+        windowSize=1000*duration, step=1000*duration, forceTriggerTime=1000*duration,
+        metrics=tse_day_metrics,  
+        dummyTable=objByName(snapshot_table_name), 
+        outputTable=objByName(day_table_name),
+        timeColumn=`data_time, 
+        keyColumn=`InstrumentID,
+        closed=`right,forceTriggerTime=0,forceTriggerSessionEndTime=0,keyPurgeDaily=false,
+        sessionBegin=s_start, 
+        sessionEnd=e_end
+    )
+    subscribeTable(,
+        tableName=snapshot_table_name, 
+        actionName="tse_day_"+string(type_number), 
+        handler=tableInsert{tse_day}, 
+        filter=symbol_list,
+        msgAsTable=true
+    )
+
+}
+
+
+setStreamTableFilterColumn(objByName(snapshot_table_name), `InstrumentID)
+for (i in 0:size(ss_ee_map)){
+    sym_list, exch, oas, oae, cs, ce, cae = ss_ee_map[i][["symb_list","ExchangeID", "open_auction_start", "open_auction_end", "continuous_start", "continuous_end", "close_auction_end"]]
+    ss_list = each(x -> isNull(x) ? NULL : time(split(x, ",")), cs)[0]
+    ee_list = each(x -> isNull(x) ? NULL : time(split(x, ",")), ce)[0]
+    build_ctp_minute(
+        snapshot_table_name,min_table_name,
+        ss_list,ee_list,i,symbol(sym_list)
+    )
+    build_ctp_day(
+        snapshot_table_name,day_table_name,
+        ss_list,ee_list,i,symbol(sym_list)
+    )
+}
+
+
+ctp::subscribe(conn, ctpSubType, objByName(ctpSubTBName), ids);
+
+ctp::close(conn)
+clearAllCache()
+
+
+dropSharedTables(`ctpMarketDataStream)
+dropSharedTables(`ctpSnapshot)
+dropSharedTables(`ctpMin`ctpDay)
+
+
+
+/*
+current delta, close_price and settlement price are only generated after the market close. CFFEX: some 15:27 time, CZCE: 15:00:00.000, other exchanges: 15:00:00.500
+2）there are already volume for the first tick, is it from the auction tick? If it is we should minus that from the total turnover
+ */
+ 
+// sample_data = select * from ctpMarketDataStream
+// share(sample_data, "sample")
+
+
+replay( inputTables=futures_data, 
+        outputTables=ctpMarketDataStream, 
+        dateColumn="TradingDay", 
+        timeColumn="tradeTime"
+)
+
+select * from ctpMin where InstrumentID == "UR512"
+select distinct InstrumentID, trade_date from ctpSnapshot
+
+/*
+1) have to clean up every wrong tick beforehand
+2) for any group, if there are no data afterwards, the windows would not be closed. And this have nothing to do with the closed parameters
+ */
+ 
+ select avg(elapsedMicroseconds) from ctpSnapshot
+ 

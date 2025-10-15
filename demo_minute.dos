@@ -1,0 +1,163 @@
+
+bar_M = parquet::loadParquet("dominantContractStreamM.parquet")
+bar_Y = parquet::loadParquet("dominantContractStreamY.parquet")
+
+//define shared stream tables for two symbols
+enableTableShareAndPersistence(table=streamTable(1000:0, bar_M.schema().colDefs.name, bar_M.schema().colDefs.typeString), tableName=`m_bar_stream)
+go
+
+enableTableShareAndPersistence(table=streamTable(1000:0, bar_Y.schema().colDefs.name, bar_Y.schema().colDefs.typeString), tableName=`y_bar_stream)
+go
+
+// building a map between current timestamp with next timestamp in historical dataset
+def time_map(bar_M){
+    temp_time = select datetime from bar_M order by datetime asc
+    temp_time_now = temp_time.datetime
+    temp_time_next = move(temp_time_now,-1)
+    temp_time_map = streamTable(temp_time_now as `trade_time, temp_time_next as `order_fill_time)
+    share(temp_time_map,`time_map)
+}
+
+time_map(bar_M)
+go
+
+//aggregate the stream tables of two symbols by datetime column into one stream table and calculate the price ratio
+
+enableTableShareAndPersistence(table=streamTable(1000:0, `trade_time`trade_date`price_ratio`y_close`m_close, [TIMESTAMP,DATE,DOUBLE,DOUBLE,DOUBLE]), tableName=`ratio_stream)
+go
+
+lsjEngine=createLeftSemiJoinEngine(name="join_ratio", leftTable=y_bar_stream, rightTable=m_bar_stream, outputTable=ratio_stream,  metrics=<[y_bar_stream.trading_date, y_bar_stream.close/m_bar_stream.close, y_bar_stream.close,m_bar_stream.close]>, matchingColumn=`datetime, updateRightTable=true)
+
+subscribeTable(tableName=`y_bar_stream, actionName="join_ratio_left", offset=-1, handler=appendForJoin{lsjEngine, true}, msgAsTable=true)
+
+subscribeTable(tableName=`m_bar_stream, actionName="join_ratio_right", offset=-1, handler=appendForJoin{lsjEngine, false}, msgAsTable=true)
+
+// calculate the bollinger band value of price_ratio
+enableTableShareAndPersistence(table=streamTable(1000:0, `latency`count`trade_time`trade_date`price_ratio`upper`mean`lower, [LONG,INT,TIMESTAMP,DATE,DOUBLE,DOUBLE,DOUBLE,DOUBLE]), tableName=`bband_value_stream)
+go
+
+use ta
+ta_bband_Metrics = <[
+    trade_time,
+    trade_date,
+    price_ratio,
+    ta::bBands(price_ratio, timePeriod=2, nbdevUp=1, nbdevDn=1, maType=0)[0] as `upper,
+    ta::bBands(price_ratio, timePeriod=2, nbdevUp=1, nbdevDn=1, maType=0)[1] as `mean,
+    ta::bBands(price_ratio, timePeriod=2, nbdevUp=1, nbdevDn=1, maType=0)[2] as `lower
+]>
+createReactiveStateEngine(name="ta_bband_engine",
+metrics=ta_bband_Metrics, dummyTable=ratio_stream, outputTable=bband_value_stream, keepOrder=true,outputElapsedMicroseconds=true)
+
+subscribeTable(tableName=`ratio_stream, actionName="ta_bband_engine", handler=getStreamEngine("ta_bband_engine"), msgAsTable=true)
+
+// based on bollinger bands cross, get trading signal stream
+enableTableShareAndPersistence(table=streamTable(1000:0, `latency`count`trade_time`trade_date`signal, [LONG,INT,TIMESTAMP,DATE,INT]), tableName=`bband_signal_stream)
+go
+
+def signal_(price_ratio_, high_, low_, price_ratio_prev_, high_prev_, low_prev_){
+    temp_ratio = price_ratio_[0]
+    temp_ratio_prev = price_ratio_prev_[0]
+    temp_high = high_[0]
+    temp_high_prev = high_prev_[0]
+    temp_low = low_[0]
+    temp_low_prev = low_prev_[0]
+    if (temp_ratio is null or temp_ratio_prev is null){
+        temp_signal = 0
+    }
+    else if (temp_ratio>temp_high and temp_ratio_prev<=temp_high_prev){
+        temp_signal = 1
+    }
+    else if (temp_ratio<temp_low and temp_ratio_prev>=temp_low_prev){
+        temp_signal = -1
+    }
+    else {
+        temp_signal = 0
+    }
+    return temp_signal
+}
+
+createReactiveStateEngine(name="bband_signal_engine",
+metrics=<[trade_time,trade_date,signal_(price_ratio,upper,lower,prev(price_ratio),prev(upper),prev(lower))]>, dummyTable=bband_value_stream, outputTable=bband_signal_stream, keepOrder=true,outputElapsedMicroseconds=true)
+
+subscribeTable(tableName=`bband_value_stream, actionName="bband_signal_engine", handler=getStreamEngine("bband_signal_engine"), msgAsTable=true)
+
+// generate order stream based on signals
+enableTableShareAndPersistence(table=streamTable(1000:0, `latency`count`trade_time`trade_date`long_symbol`short_symbol, [LONG,INT,TIMESTAMP,DATE,STRING,STRING]), tableName=`bband_order_stream)
+go
+
+def order_(order_){
+    temp_order = order_[0]
+    if (temp_order == 1){
+        return `y2601`m2601
+    }
+    else if (temp_order == -1){
+        return `m2601`y2601
+    }
+    else{
+        return [string(`nan), string(`nan)]
+    }
+}
+
+createReactiveStateEngine(name="bband_order_engine",
+metrics=[<trade_time>, <trade_date>, <order_(signal)[0]>,<order_(signal)[1]>], dummyTable=bband_signal_stream, outputTable=bband_order_stream, keepOrder=true,outputElapsedMicroseconds=true)
+
+subscribeTable(tableName=`bband_signal_stream, actionName="bband_order_engine", handler=getStreamEngine("bband_order_engine"), msgAsTable=true)
+
+// adjust order's trade_time to next time point, based on the time_map table
+enableTableShareAndPersistence(table=streamTable(1000:0, `trade_time`trade_date`order_fill_time`long_symbol`short_symbol, [TIMESTAMP,DATE,TIMESTAMP,STRING,STRING]), tableName=`bband_order_stream_time_adjust)
+go
+
+lookup_time_engine=createLookupJoinEngine(name="join_time_map", leftTable=bband_order_stream, rightTable=time_map, outputTable=bband_order_stream_time_adjust,  metrics=<[trade_date, order_fill_time, long_symbol,short_symbol]>, matchingColumn=`trade_time, checkTimes=duration(1ms))
+
+subscribeTable(tableName=`bband_order_stream, actionName="join_time_map_left", offset=-1, handler=appendForJoin{lookup_time_engine, true}, msgAsTable=true)
+
+subscribeTable(tableName=`time_map, actionName="join_time_map_right", offset=-1, handler=appendForJoin{lookup_time_engine, false}, msgAsTable=true)
+
+// based on order_fill_time column, match close prices of two symbols
+enableTableShareAndPersistence(table=streamTable(1000:0, `order_fill_time`trade_time`trade_date`long_symbol`short_symbol`y2601_close`m2601_close, [TIMESTAMP,TIMESTAMP,DATE,STRING,STRING,DOUBLE,DOUBLE]), tableName=`bband_order_price_stream)
+go
+
+leftsemi_join_price_engine=createLeftSemiJoinEngine(name="join_order_price", leftTable=bband_order_stream_time_adjust, rightTable=ratio_stream, outputTable=bband_order_price_stream,  metrics=<[bband_order_stream_time_adjust.trade_time, bband_order_stream_time_adjust.trade_date,long_symbol,short_symbol,y_close,m_close]>, matchingColumn=[[`order_fill_time],[`trade_time]])
+
+subscribeTable(tableName=`bband_order_stream_time_adjust, actionName="join_order_price_left", offset=-1, handler=appendForJoin{leftsemi_join_price_engine, true}, msgAsTable=true)
+
+subscribeTable(tableName=`ratio_stream, actionName="join_order_price_right", offset=-1, handler=appendForJoin{leftsemi_join_price_engine, false}, msgAsTable=true)
+
+// replay
+replay(inputTables=[bar_M, bar_Y], outputTables=[m_bar_stream, y_bar_stream], dateColumn=`trading_date,timeColumn=`datetime)
+
+
+getStreamingStat()
+getStreamEngineList()
+
+unsubscribeTable(tableName=`y_bar_stream, actionName="join_ratio_left")
+unsubscribeTable(tableName=`m_bar_stream, actionName="join_ratio_right")
+unsubscribeTable(tableName=`ratio_stream, actionName="ta_bband_engine")
+unsubscribeTable(tableName=`bband_value_stream, actionName="bband_signal_engine")
+unsubscribeTable(tableName=`bband_signal_stream, actionName="bband_order_engine")
+unsubscribeTable(tableName=`bband_order_stream, actionName="join_time_map_left")
+unsubscribeTable(tableName=`time_map, actionName="join_time_map_right")
+unsubscribeTable(tableName=`bband_order_stream_time_adjust, actionName="join_order_price_left")
+unsubscribeTable(tableName=`ratio_stream, actionName="join_order_price_right")
+
+dropStreamEngine(`join_ratio)
+dropStreamEngine(`ta_bband_engine)
+dropStreamEngine(`bband_signal_engine)
+dropStreamEngine(`bband_order_engine)
+dropStreamEngine(`join_time_map)
+dropStreamEngine(`join_order_price)
+
+dropStreamTable(`m_bar_stream)
+dropStreamTable(`y_bar_stream)
+dropStreamTable(`ratio_stream)
+dropStreamTable(`bband_value_stream)
+dropStreamTable(`bband_signal_stream)
+dropStreamTable(`bband_order_stream)
+dropStreamTable(`bband_order_stream_time_adjust)
+dropStreamTable(`bband_order_price_stream)
+
+undef(`time_map, SHARED)
+
+
+
+

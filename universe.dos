@@ -1,0 +1,60 @@
+def formBasicInfoTable(){
+    /*
+    1) Instrument Name might include Chinese, use ExchangeID instead
+    2) reserve* are empty fields
+    3) product class 1 - futures, 2&6 - options (2 for american and 6 for european), 
+        3 - spread, 5 - random shit, 7 - TAS, all are char
+    */
+
+    // simnow cannot return the full list of instruments and would cause a lot of delay
+    // tb = ctp::queryInstrument("182.254.243.31", 30001,"224829", "Evan@cash1q2", "9999", "simnow_client_test", "0000000000000000")
+    tb = ctp::queryInstrument("180.166.103.21", 55205,"2520000355", "jacky83611", "4040", "client_LO_1.0", "IM53ZG1HKVEYHPAI")
+    tmp = select * from tb where ProductClass in ['1','2','6'] // options + futures, use InstrumentID, ExchangeID
+    share(tmp, "basicInfoTable")
+    
+    // There are aroud 800 futures and 17000 optiones in total, futures with > 100000000 turnover around 300, options associated with these active futures around 20(futures)*20(options with turnover > 10000000 per futures), so need around 1000 active subscriptions each day 
+}
+
+def combineExchangeTimesAndStrategy(){
+    tmp = loadText("./exchangeTimes/exchangeTimes.csv")
+    temp = (select exchange, parent_symbol from tmp).copy()
+    for (i in tmp.columnNames()[4:]){
+        temp[i] = each(x -> isNull(x) ? "" : x, tmp[i])
+        // temp[i] = array(TIME[], 0).append!(time(tmp[i].split(',')))  // a way to convert to time []
+    } 
+
+    t1 = select * from basicInfoTable where ProductClass == '1' // futures 
+    t3 = lj(t1, temp, ['ExchangeID', 'ProductID'], ['exchange', 'parent_symbol'])
+    t3['parent_id'] = t3['ProductID'].copy()
+    t3['UnderlyingInstrID'] = t3['ProductID'].copy()
+    try {if (size(t1) != size(t3)) throw "universe_calculation_mistakes: t1!=t3"} catch(ex){print ex};
+    
+    t2 = select * from basicInfoTable where ProductClass == '2' or ProductClass == '6' // options
+    t5 = select parent_id, ExchangeID, InstrumentID, open_auction_start, open_auction_end, special_open_auction_start, special_open_auction_end, close_auction_start, close_auction_end, special_close_auction_start, special_close_auction_end, continuous_start, continuous_end, special_continous_start, special_continous_end from t3
+    t4 = lj(t2, t5, ['ExchangeID', 'UnderlyingInstrID'], ['ExchangeID', 'InstrumentID'])
+    try {if (size(t2) != size(t4)) throw "universe_calculation_mistakes: t2!=t4"} catch(ex){print ex};
+
+    try {if (t3.shape()[1] != t4.shape()[1]) throw "universe_calculation_mistakes: t3!=t4"} catch(ex){print ex}; 
+    t = unionAll(t3,t4, byColName=true)
+    addColumn(t, ["timezone","currency"], [STRING, STRING])
+    sqlUpdate(table = t, updates=[<"Asia/Shanghai" as timezone>,<"RMB" as currency>]).eval()
+
+    // addColumn(t, "strategy_weight", DOUBLE[])
+    // sqlUpdate(table = t, updates=[<[1.0,1.0,1.0,1.0,1.0,1.0] as strategy_weight>]).eval()
+
+    cleanData = def(v) -> iif((abs(v) >= 1.7976931348623157e+308) || (v != v), NULL, v)
+    t[`LongMarginRatio] = cleanData(t.LongMarginRatio)
+    t[`ShortMarginRatio] = cleanData(t.ShortMarginRatio)
+    t[`StrikePrice] = cleanData(t.StrikePrice)
+    undef(`basicInfoTable, SHARED)
+    share(t, "universe")
+}
+
+formBasicInfoTable();go
+combineExchangeTimesAndStrategy();go
+
+
+
+
+
+

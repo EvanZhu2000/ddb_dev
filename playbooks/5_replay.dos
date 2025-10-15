@@ -1,0 +1,177 @@
+
+def dropSharedTabless(tbNames){
+    for (tbName in tbNames){
+        try{disableTablePersistence(objByName(tbName))}catch(ex){}
+        tb = select * from getStreamingStat().pubTables where tableName = tbName
+        for (i in tb){
+            actionList = i.actions
+            for (j in split(actionList.strReplace("[", "").strReplace("]", ""), ",")){
+                unsubscribeTable(, tbName, j)
+            }
+        }
+        undef(tbName, SHARED)
+    }
+}
+
+///////
+
+
+dropSharedTables(`ctp_data)
+share streamTable(1000:0, Y_clean.schema().colDefs.name, Y_clean.schema().colDefs.typeString) as ctp_data
+
+
+try{dropSharedTables("sig1_stream_tmp1")}catch(ex){}
+share streamTable(1000:0, 
+`datetime`parent_order_book_id`seq`order_book_id`open`close`is_roll_date`scheduled_roll_date,
+[DATETIME,SYMBOL,INT,STRING,STRING,STRING,BOOL,DATE]) as sig1_stream_tmp1
+
+try{dropSharedTables("sig1_stream_tmp2")}catch(ex){}
+share streamTable(1000:0, 
+`datetime`parent_order_book_id`seq`order_book_id`open`close`is_roll_date`scheduled_roll_date,
+[DATETIME,SYMBOL,INT,STRING,DOUBLE[],DOUBLE[],BOOL,DATE]) as sig1_stream_tmp2
+
+try{dropStreamEngine(`alpha11)}catch(ex){}
+sig1_engine_cs = createCrossSectionalEngine(
+    name=`alpha11,
+    metrics=<[
+        parent_order_book_id,
+        rowNo(close),
+        concat(string(order_book_id), ","),
+        concat(string(open), ","),
+        concat(string(close), ","),
+        first(is_roll_date),
+        first(scheduled_roll_date)
+    ]>,
+    dummyTable=ctp_data, outputTable=sig1_stream_tmp1, 
+    useSystemTime=false,
+    keyColumn=`parent_order_book_id, timeColumn=`datetime,
+    triggeringPattern='keyCount', triggeringInterval=2
+)
+subscribeTable(tableName=`ctp_data, actionName="sig1_cs", handler=append!{sig1_engine_cs}, msgAsTable=true)
+
+def cs_to_row(msg, ttl_count){
+    result = select * from msg where seq==ttl_count-1
+    replaceColumn!(
+        result, `open, 
+        array(DOUBLE[],0).append!((select double(split(open, ',')) as split from result)['split'])
+    )
+    replaceColumn!(
+        result, `close, 
+        array(DOUBLE[],0).append!((select double(split(close, ',')) as split from result)['split'])
+    )
+    sig1_stream_tmp2.append!(result)
+}
+
+subscribeTable(tableName=`sig1_stream_tmp1, actionName="sig1_stream_tmp1", handler=cs_to_row{,2}, msgAsTable=true)
+
+//////////
+
+
+window = 3
+def compute_rolling_zscore_grouped(close, window){
+    return (log(close[0]/close[1]) - mavg(log(close[0]/close[1]), window)) / mstd(log(close[0]/close[1]), window)
+}
+
+// result =  (select close from sig1_stream_tmp2).close
+// z_series = compute_rolling_zscore_grouped(result, window)
+
+def nested_generate_trading_signals_reversion(z, 
+                                                mutable current_position,
+                                                entry_threshold_long,
+                                                entry_threshold_short,
+                                                exit_threshold_long,
+                                                exit_threshold_short)
+{
+    signal = 0  
+    
+    // ENTRY logic
+    if (current_position == 0){
+        if (z < entry_threshold_long){
+            current_position = 1  // Enter long
+            signal = 1
+        } else {
+            if (z > entry_threshold_short){
+                current_position = -1  // Enter short
+                signal = -1
+            } else {
+                signal = current_position
+            }
+        }
+    }
+    
+    // EXIT logic
+    if (current_position == 1) {
+        if (z > exit_threshold_long){
+            current_position = 0
+            signal = 0
+        } else {
+            signal = current_position
+        }
+    }
+    
+    if (current_position == -1) {
+        if (z < exit_threshold_short){
+            current_position = 0
+            signal = 0
+        } else {
+            signal = current_position
+        }
+    }
+    
+    return signal  // Added return statement
+}
+
+def generate_trading_signals_reversion(z_series, 
+                                        mutable current_position,
+                                        entry_threshold_long=-1.0,
+                                        entry_threshold_short=1.0,
+                                        exit_threshold_long=0.0,
+                                        exit_threshold_short=0.0)
+{
+    
+    return each(nested_generate_trading_signals_reversion, 
+                z_series.nullFill(0),
+                current_position,
+                entry_threshold_long,
+                entry_threshold_short,
+                exit_threshold_long,
+                exit_threshold_short)
+}
+
+// z_score = generate_trading_signals_reversion(z_series, 0)
+
+try{dropSharedTables("sig1_stream_tmp3")}catch(ex){}
+share streamTable(1000:0, 
+`datetime`order_book_id`open`close`is_roll_date`scheduled_roll_date`signal,
+[DATETIME,STRING,DOUBLE[],DOUBLE[],BOOL,DATE,INT]) as sig1_stream_tmp3
+
+def sig1_handler(msg, window){
+    result = select datetime, order_book_id, open, close, is_roll_date, scheduled_roll_date from msg
+    update result set signal = generate_trading_signals_reversion(
+        compute_rolling_zscore_grouped(result.close, window),0
+    )
+    sig1_stream_tmp3.append!(result)
+}
+
+subscribeTable(tableName=`sig1_stream_tmp2, actionName="sig1_stream_tmp2", handler=sig1_handler{,window}, msgAsTable=true)
+
+/////////
+
+
+execution_config = dict(STRING, ANY)
+execution_config['entry_execution_price'] = 'open'
+execution_config['execution_lag'] = 1
+execution_config['exit_execution_price'] = 'open'
+execution_config['max_gap_days'] = 2
+execution_config['max_holding_minutes'] = NULL
+execution_config['stop_loss_pct'] = 0.002
+
+
+
+/////////
+
+replay(inputTables=[M_clean.head(100), Y_clean.head(100)], outputTables=ctp_data, timeColumn=`datetime)
+
+
+
+clearAllCache()

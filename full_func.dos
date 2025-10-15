@@ -1,0 +1,251 @@
+// ============================================================================
+// 1. Global Parameters & Schemas
+// ============================================================================
+
+def set_global_parameters(){
+	// Connection Parameters
+	share "180.166.103.21" as ip
+	share 55213 as port
+	share dict(STRING, ANY, ["OutputElapsed", "ReceivedTime", "ConcatTime"], [true, true, true]) as ctp_config
+	share `m2601`y2601 as ids
+	share "marketData" as ctpSubType
+
+	// Table and Stream Names
+	share "ctpMarketDataStream" as ctpSubTBName
+	share "ctpSnapshot" as snapshot_table_name
+	share "ctpMin" as min_table_name
+	share "ctpDay" as day_table_name
+	share "result_stream" as result_stream_name
+
+	// DFS Database and Table Names
+	share "dfs://ctp_snapshot" as ctpSnapshotDB
+	share "ctp_snapshot" as ctpSnapshotTB
+	share "dfs://ctp_day" as ctpDayDB
+	share "ctp_day" as ctpDayTB
+	share "dfs://ctp_minute" as ctpMinDB
+	share "ctp_minute" as ctpMinTB
+
+	// Capacity and Engine Parameters
+	share 300000 as marketTBCapacity
+	share 1 as bband_mul
+	share 3 as mavg_dur
+	share 2 as num_of_sym
+	share 60 as nSec
+
+	// Trading Session Times
+	share [21:00:00.000, 09:00:00.000, 10:30:00.000, 13:30:00.000] as ss_list
+	share [23:00:00.000, 10:15:00.000, 11:30:00.000, 15:00:00.000] as ee_list
+
+	// Schemas
+	share `InstrumentID`trade_date`last_price`open_price`high_price`low_price`close_price`volume`turnover`open_interest`pre_settlement_price`pre_close_price`pre_open_interest`pre_delta`upper_limit_price`lower_limit_price`bid_price`bid_volume`ask_price`ask_volume`trade_time`data_time`utc_data_time as snapshot_coldef_name
+	share [SYMBOL,,DATE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,INT,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE[],INT[],DOUBLE[],INT[],TIME,TIMESTAMP,TIMESTAMP] as snapshot_coldef_type
+	share `data_time`InstrumentID`trade_date`open`high`low`close`volume`open_interest`turnover`pre_settlement_price`pre_close_price`pre_open_interest`pre_delta`upper_limit_price`lower_limit_price`first_bid_price`first_ask_price`first_bid_volume`first_ask_volume`avg_spread as minute_coldef_name
+	share [TIMESTAMP,SYMBOL,DATE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,INT,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,INT,INT,DOUBLE] as minute_coldf_type
+	share `data_time`InstrumentID`trade_date`open`high`low`close`volume`open_interest`turnover`pre_settlement_price`pre_close_price`pre_open_interest`pre_delta`upper_limit_price`lower_limit_price`first_bid_price`first_ask_price`first_bid_volume`first_ask_volume`avg_spread as day_coldef_name
+	share [TIMESTAMP,SYMBOL,DATE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,INT,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,INT,INT,DOUBLE] as day_coldef_type
+}
+go
+
+// ============================================================================
+// 2. Utility Functions
+// ============================================================================
+
+def end_minus_start_time_seconds(startT, endT){
+    return iif(endT-startT<0, (endT-startT+12:00:00.000+12:00:00.000) / 1000, (endT-startT)/1000)
+}
+
+def toDfs(streamTBName, DBName, TBName){
+    subscribeTable(tableName=streamTBName, actionName=streamTBName + "ToDfs", offset=-1, handler=loadTable(DBName, TBName), msgAsTable=true, batchSize=5000, throttle=1,reconnect=true)
+}
+
+def xdropStreamTable(streamTBName){
+    tb = select * from getStreamingStat().pubTables where tableName = streamTBName
+    for (i in tb){
+        actionName = i.actions
+        unsubscribeTable(, streamTBName, actionName)
+    }
+    dropStreamTable(streamTBName)
+}
+go
+
+// ============================================================================
+// 3. Core Logic Functions
+// ============================================================================
+
+def connect_ctp(ip, port, config){
+    return ctp::connect(ip, port, config)
+}
+
+def create_stream_tables(conn, ctpSubType, ctpSubTBName, snapshot_table_name, min_table_name, day_table_name, result_stream_name, marketTBCapacity){
+    // CTP Market Data Stream Table
+    tb = ctp::getSchema(conn, ctpSubType) 
+    if (not existsStreamTable(ctpSubTBName)){
+        enableTableShareAndPersistence(table=streamTable(marketTBCapacity:0, tb.name, tb.typeString), tableName=ctpSubTBName, cacheSize=marketTBCapacity, preCache=0)
+    };go
+
+    // Snapshot Stream Table
+    if (not existsStreamTable(snapshot_table_name)){
+        enableTableShareAndPersistence(table=streamTable(marketTBCapacity:0, snapshot_coldef_name, snapshot_coldef_type), tableName=snapshot_table_name, cacheSize=marketTBCapacity, preCache=0)
+    };go
+
+    // Minute Stream Table
+    if (not existsStreamTable(min_table_name)){
+        enableTableShareAndPersistence(table=streamTable(int(marketTBCapacity/10):0, minute_coldef_name, minute_coldf_type), tableName=min_table_name, cacheSize=int(marketTBCapacity/10), preCache=0)
+    };go
+
+    // Day Stream Table
+    if (not existsStreamTable(day_table_name)){
+        enableTableShareAndPersistence(table=streamTable(int(marketTBCapacity/100):0, day_coldef_name, day_coldef_type), tableName=day_table_name, cacheSize=int(marketTBCapacity/100), preCache=0)
+    };go
+
+    // Result Stream Table
+    share(streamTable(int(marketTBCapacity/10):0, `data_time`InstrumentID`delta`upper`lower`factor1`factor2, [TIMESTAMP,SYMBOL, DOUBLE, DOUBLE, DOUBLE, INT,INT]), result_stream_name);
+    go
+}
+
+def create_dfs_tables(){
+    // Snapshot DFS Table
+    if(!existsDatabase(ctpSnapshotDB)) {
+        dbDate = database(, partitionType=VALUE, partitionScheme=2025.01.01..2028.01.01)
+        dbSymbol = database(, partitionType=HASH, partitionScheme=[SYMBOL, 20])
+        db = database(directory=ctpSnapshotDB, partitionType=COMPO, partitionScheme=[dbDate, dbSymbol], engine="TSDB", atomic="CHUNK")
+        setRetentionPolicy(dbHandle=db, retentionHours=720)
+        undef(`dbDate); undef(`dbSymbol)
+    }
+    if(!existsTable(ctpSnapshotDB, ctpSnapshotTB)){
+        db = database(ctpSnapshotDB)
+        db.createPartitionedTable(table=table(1:0,snapshot_coldef_name,snapshot_coldef_type), tableName=ctpSnapshotTB, partitionColumns=`trade_date`InstrumentID, sortColumns=`InstrumentID`data_time, keepDuplicates=ALL)
+    }
+
+    // Day DFS Table
+    if(!existsDatabase(ctpDayDB)) {
+        database(directory=ctpDayDB, partitionType=RANGE, partitionScheme=2010.01M + (0..30)*12, engine='OLAP')
+    }
+    if(!existsTable(ctpDayDB, ctpDayTB)){
+        db = database(ctpDayDB)
+        db.createPartitionedTable(table=table(1:0,day_coldef_name, day_coldef_type), tableName=ctpDayTB, partitionColumns=`data_time)
+    }
+
+    // Minute DFS Table
+    if(!existsDatabase(ctpMinDB)) {
+        database(directory=ctpMinDB, partitionType=VALUE, partitionScheme=2025.01.01..2028.01.01, engine='OLAP')
+    }
+    if(!existsTable(ctpMinDB, ctpMinTB)){
+        db = database(ctpMinDB)
+        db.createPartitionedTable(table=table(1:0,minute_coldef_name, minute_coldf_type), tableName=ctpMinTB, partitionColumns=`data_time)
+    }
+}
+go
+
+def create_computing_engines(){
+    // RSE for Snapshot
+    now_day = date(now())
+    rse_metrics=<[
+        iif(tradeTime > 20:00:00.000, temporalAdd(now_day, 1, "d"), now_day) as trade_date,
+        LastPrice as last_price, OpenPrice as open_price, HighestPrice as high_price, LowestPrice as low_price, ClosePrice as close_price,
+        Volume as volume, Turnover as turnover, OpenInterest as open_interest, PreSettlementPrice as pre_settlement_price,
+        PreClosePrice as pre_close_price, PreOpenInterest as pre_open_interest, PreDelta as pre_delta,
+        UpperLimitPrice as upper_limit_price, LowerLimitPrice as lower_limit_price,
+        fixedLengthArrayVector(BidPrice1, BidPrice2, BidPrice3, BidPrice4, BidPrice5) as bid_price,
+        fixedLengthArrayVector(BidVolume1, BidVolume2, BidVolume3, BidVolume4, BidVolume5) as bid_volume,
+        fixedLengthArrayVector(AskPrice1, AskPrice2, AskPrice3, AskPrice4, AskPrice5) as ask_price,
+        fixedLengthArrayVector(AskVolume1, AskVolume2, AskVolume3, AskVolume4, AskVolume5) as ask_volume,
+        tradeTime as trade_time,
+        temporalParse(string(iif(tradeTime > 20:00:00.000, temporalAdd(now_day, 1, "d"), now_day)) + " " + string(tradeTime), "yyyy.MM.dd HH:mm:ss.SSS") as data_time,
+        temporalAdd(temporalParse(string(iif(tradeTime > 20:00:00.000, temporalAdd(now_day, 1, "d"), now_day)) + " " + string(tradeTime), "yyyy.MM.dd HH:mm:ss.SSS"), -8, "H") as utc_data_time
+    ]>
+    rse = createReactiveStateEngine(name="rse_0", metrics=rse_metrics, dummyTable=objByName(ctpSubTBName), outputTable=objByName(snapshot_table_name), keyColumn="InstrumentID")
+    subscribeTable(, ctpSubTBName, "rse_0", handler=tableInsert{rse}, msgAsTable=true)
+
+    // TSE for Minute Bars
+    tse_min_metrics=<[
+        last(trade_date) as trade_date, firstNot(last_price, 0.0) as open, max(last_price, high_price) as high,
+        min(last_price, low_price) as low, lastNot(last_price, 0.0) as close, last(volume)-first(volume) as volume,
+        last(open_interest) as open_interest, last(turnover) - first(turnover) as turnover, last(pre_settlement_price) as pre_settlement_price,
+        last(pre_close_price) as pre_close_price, last(pre_open_interest) as pre_open_interest, last(pre_delta) as pre_delta,
+        last(upper_limit_price) as upper_limit_price, last(lower_limit_price) as lower_limit_price,
+        first(bid_price[0]) as first_bid_price, first(ask_price[0]) as first_ask_price,
+        first(bid_volume[0]) as first_bid_volume, first(ask_volume[0]) as first_ask_volume,
+        avg(ask_price[0] - bid_price[0]) as avg_spread
+    ]>
+    tse_min = createDailyTimeSeriesEngine(name="tse_min_0", windowSize=1000*nSec, step=1000*nSec, forceTriggerTime=1000*nSec, metrics=tse_min_metrics, dummyTable=objByName(snapshot_table_name), outputTable=objByName(min_table_name), timeColumn=`data_time, keyColumn=`InstrumentID, fill=`ffill, sessionBegin=ss_list, sessionEnd=ee_list)
+    subscribeTable(, tableName=snapshot_table_name, actionName="tse_min_0", handler=tableInsert{tse_min}, msgAsTable=true)
+
+    // TSE for Day Bars
+    tse_day_metrics=<[
+        last(trade_date) as trade_date, lastNot(open_price, 0.0) as open, lastNot(high_price, 0.0) as high,
+        lastNot(low_price, 0.0) as low, lastNot(last_price, 0.0) as close, last(volume) as volume,
+        last(open_interest) as open_interest, last(turnover) as turnover, last(pre_settlement_price) as pre_settlement_price,
+        last(pre_close_price) as pre_close_price, last(pre_open_interest) as pre_open_interest, last(pre_delta) as pre_delta,
+        last(upper_limit_price) as upper_limit_price, last(lower_limit_price) as lower_limit_price,
+        first(bid_price[0]) as first_bid_price, first(ask_price[0]) as first_ask_price,
+        first(bid_volume[0]) as first_bid_volume, first(ask_volume[0]) as first_ask_volume,
+        avg(ask_price[0] - bid_price[0]) as avg_spread
+    ]>
+    s_start, e_end = ss_list[0], ee_list[int(size(ee_list)-1)]
+    duration = end_minus_start_time_seconds(s_start, e_end)
+    tse_day = createDailyTimeSeriesEngine(name="tse_day_0", windowSize=1000*duration, step=1000*duration, forceTriggerTime=1000*duration, metrics=tse_day_metrics, dummyTable=objByName(snapshot_table_name), outputTable=objByName(day_table_name), timeColumn=`data_time, keyColumn=`InstrumentID, fill=`ffill, sessionBegin=s_start, sessionEnd=e_end)
+    subscribeTable(, tableName=snapshot_table_name, actionName="tse_day_0", handler=tableInsert{tse_day}, msgAsTable=true)
+
+    // Alpha Strategy Stream Engine
+    streamEngine=streamEngineParser(
+        name=`alpha0, 
+        metrics=<[InstrumentID, byRow(deltas,close),
+            mavg(byRow(deltas,close),mavg_dur) - bband_mul* mstd(byRow(deltas,close),mavg_dur),
+            mavg(byRow(deltas,close),mavg_dur) + bband_mul* mstd(byRow(deltas,close),mavg_dur),
+            iif(isNull(mavg(byRow(deltas,close),mavg_dur)),0, iif(byRow(deltas,close) < mavg(byRow(deltas,close),mavg_dur) - bband_mul* mstd(byRow(deltas,close),mavg_dur), -1, iif(byRow(deltas,close) > mavg(byRow(deltas,close),mavg_dur) + bband_mul* mstd(byRow(deltas,close),mavg_dur), 1, 0))),
+            iif(isNull(mavg(byRow(deltas,close),mavg_dur)),0, iif(byRow(deltas,close) < mavg(byRow(deltas,close),mavg_dur) - bband_mul* mstd(byRow(deltas,close),mavg_dur), 1, iif(byRow(deltas,close) > mavg(byRow(deltas,close),mavg_dur) + bband_mul* mstd(byRow(deltas,close),mavg_dur), -1, 0)))
+        ]>, 
+        dummyTable=objByName(min_table_name), outputTable=objByName(result_stream_name), 
+        keyColumn=`InstrumentID, timeColumn=`data_time,
+        useSystemTime=false, useWindowStartTime=false,
+        triggeringPattern='keyCount', triggeringInterval=num_of_sym
+    )
+    subscribeTable(tableName=min_table_name, actionName="test_stream", handler=append!{streamEngine}, msgAsTable=true)
+    go
+}
+
+def persist_data(){
+    toDfs(snapshot_table_name, ctpSnapshotDB, ctpSnapshotTB)
+    toDfs(day_table_name, ctpDayDB, ctpDayTB)
+    toDfs(min_table_name, ctpMinDB, ctpMinTB)
+}
+
+def subscribe_market_data(conn, ctpSubType, ctpSubTBName, ids){
+    ctp::subscribe(conn, ctpSubType, objByName(ctpSubTBName), ids)
+}
+go
+
+// ============================================================================
+// 4. Main Execution
+// ============================================================================
+
+def main(){
+    // Step 1: Set global parameters
+    set_global_parameters()
+    
+    // Step 2: Connect to CTP
+    conn = connect_ctp(ip, port, ctp_config)
+    
+    // Step 3: Create stream tables
+    create_stream_tables(conn, ctpSubType, ctpSubTBName, snapshot_table_name, min_table_name, day_table_name, result_stream_name, marketTBCapacity)
+    
+    // Step 4: Create DFS tables for persistence
+    create_dfs_tables()
+    
+    // Step 5: Create all computing engines (RSE, TSEs, Alpha)
+    create_computing_engines()
+    
+    // Step 6: Set up data persistence subscriptions
+    persist_data()
+    
+    // Step 7: Subscribe to market data
+    subscribe_market_data(conn, ctpSubType, ctpSubTBName, ids)
+    
+    // Note: ctp::close(conn) and clearAllCache() are removed from the main flow
+    // as this script is intended for continuous data processing.
+    // They can be called manually when the service needs to be stopped.
+}
+
+main()
+

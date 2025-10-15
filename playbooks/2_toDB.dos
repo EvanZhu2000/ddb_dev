@@ -1,0 +1,76 @@
+
+
+
+ctpSnapshotDB = "dfs://ctp_snapshot"
+ctpSnapshotTB = "ctp_snapshot"
+
+if(!existsDatabase(ctpSnapshotDB)) {
+    dbDate = database(, partitionType=VALUE, partitionScheme=2025.01.01..2028.01.01)
+    dbSymbol = database(, partitionType=HASH, partitionScheme=[SYMBOL, 20])
+    db = database(
+        directory=ctpSnapshotDB,
+        partitionType=COMPO,
+        partitionScheme=[dbDate, dbSymbol],
+        engine="TSDB",
+        atomic="CHUNK"
+    )
+    setRetentionPolicy(dbHandle=db, retentionHours=720)
+    undef(`dbDate)
+    undef(`dbSymbol)
+}
+
+if(!existsTable(ctpSnapshotDB, ctpSnapshotTB)){
+    db.createPartitionedTable(
+        table=table(1:0,snapshot_coldef_name,snapshot_coldef_type),
+        tableName=ctpSnapshotTB,
+        partitionColumns=`trade_date`InstrumentID,
+        sortColumns=`InstrumentID`data_time,
+        keepDuplicates=ALL
+    )
+}
+
+
+ctpDayDB = "dfs://ctp_day"
+ctpDayTB = "ctp_day"
+if(!existsDatabase(ctpDayDB)) {
+    db = database(
+        directory=ctpDayDB,
+        partitionType=RANGE,
+        partitionScheme=2010.01M + (0..30)*12,
+        engine='OLAP'
+    )
+}
+if(!existsTable(ctpDayDB, ctpDayTB)){
+    db.createPartitionedTable(
+        table=table(1:0,day_coldef_name, day_coldef_type),
+        tableName=ctpDayTB,
+        partitionColumns=`data_time
+    )
+}
+
+ctpMinDB = "dfs://ctp_minute"
+ctpMinTB = "ctp_minute"
+if(!existsDatabase(ctpMinDB)) {
+    db = database(
+        directory=ctpMinDB,
+        partitionType=VALUE,
+        partitionScheme=2025.01.01..2028.01.01,
+        engine='OLAP'
+    )
+}
+if(!existsTable(ctpMinDB, ctpMinTB)){
+    db.createPartitionedTable(
+        table=table(1:0,minute_coldef_name, minute_coldf_type),
+        tableName=ctpMinTB,
+        partitionColumns=`data_time
+    )
+}
+
+def toDfs(streamTBName, DBName, TBName){
+    subscribeTable(tableName=streamTBName, actionName=streamTBName + "ToDfs", offset=-1, handler=loadTable(DBName, TBName), msgAsTable=true, batchSize=5000, throttle=1,reconnect=true)
+}
+toDfs(snapshot_table_name, ctpSnapshotDB, ctpSnapshotTB)
+toDfs(day_table_name, ctpDayDB, ctpDayTB)
+toDfs(min_table_name, ctpMinDB, ctpMinTB)
+
+
